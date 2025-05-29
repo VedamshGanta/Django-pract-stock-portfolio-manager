@@ -1,19 +1,27 @@
 import json
-import yfinance as yf
 from django.views.decorators.csrf import csrf_exempt
 from django.http import JsonResponse, HttpResponseBadRequest
 from .models import Trade, PortfolioEntry
+from stockdata.services import get_current_price
+from rest_framework.authentication import TokenAuthentication
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
 
+@api_view(['GET'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
 def portfolio_list(request):
-    entries = PortfolioEntry.objects.all().values(
+    entries = PortfolioEntry.objects.filter(user=request.user).values(
         'symbol', 'shares', 'average_price'
     )
     return JsonResponse(list(entries), safe=False)
 
-@csrf_exempt
+@api_view(['POST'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
 def trades_post(request):
     if request.method != 'POST':
-        return HttpResponseBadRequest("Only POST method allowed.")
+        return HttpResponseBadRequest("Only POST method allowed.", status=400)
 
     try:
         data = json.loads(request.body)
@@ -22,19 +30,17 @@ def trades_post(request):
         shares = int(data['shares'])
 
         if action not in ['BUY', 'SELL']:
-            return HttpResponseBadRequest("Action must be BUY or SELL.")
+            return HttpResponseBadRequest("Action must be BUY or SELL.", status=400)
 
-        # Get current price from yfinance
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(period="1d")
-        if hist.empty:
-            return HttpResponseBadRequest(f"No data found for {symbol}")
-        price = hist['Close'].iloc[-1]
 
-        # ✅ Validate first before logging the trade
+        price = get_current_price(symbol)
+        if price is None:
+            return HttpResponseBadRequest(f"No data found for {symbol}", status=404)
+
+        # Validate first before logging the trade
         if action == 'BUY':
             try:
-                entry = PortfolioEntry.objects.get(symbol=symbol)
+                entry = PortfolioEntry.objects.get(user=request.user, symbol=symbol)
                 total_shares = entry.shares + shares
                 total_cost = (entry.shares * entry.average_price) + (shares * price)
                 new_avg_price = total_cost / total_shares
@@ -44,6 +50,7 @@ def trades_post(request):
                 entry.save()
             except PortfolioEntry.DoesNotExist:
                 PortfolioEntry.objects.create(
+                    user=request.user,
                     symbol=symbol,
                     shares=shares,
                     average_price=price
@@ -51,19 +58,19 @@ def trades_post(request):
 
         elif action == 'SELL':
             try:
-                entry = PortfolioEntry.objects.get(symbol=symbol)
+                entry = PortfolioEntry.objects.get(user=request.user, symbol=symbol)
                 if entry.shares < shares:
-                    return HttpResponseBadRequest("Not enough shares to sell.")
+                    return HttpResponseBadRequest("Not enough shares to sell.", status=403)
                 entry.shares -= shares
                 if entry.shares == 0:
                     entry.delete()
                 else:
                     entry.save()
             except PortfolioEntry.DoesNotExist:
-                return HttpResponseBadRequest("You do not own this stock.")
+                return HttpResponseBadRequest("You do not own this stock.", status=404)
 
-        # ✅ Log the trade only after successful portfolio update
         Trade.objects.create(
+            user=request.user,
             symbol=symbol,
             action=action,
             shares=shares,
@@ -77,12 +84,18 @@ def trades_post(request):
             'price': round(price, 2)
         }, status=201)
 
-    except (KeyError, ValueError):
-        return HttpResponseBadRequest("Invalid request data.")
+    except KeyError as e:
+        return HttpResponseBadRequest(f"Missing field: {str(e)}", status=400)
+    except ValueError:
+        return HttpResponseBadRequest("Invalid data type for 'shares'. Must be an integer.", status=400)
 
+
+@api_view(['GET'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
 def get_trades(request):
     symbol = request.GET.get('symbol')
-    trades = Trade.objects.all().order_by('-timestamp')
+    trades = Trade.objects.filter(user=request.user).order_by('-timestamp')
 
     if symbol:
         trades = trades.filter(symbol=symbol.upper())
